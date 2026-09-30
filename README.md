@@ -1,5 +1,7 @@
 # dsh-windows-notify
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
 给 DeepSeek Harness 加「**需要你操作**」的 Windows 原生通知，并且**点通知就回到 DSH**。
 
 - 对话卡在**要权限**（命令/文件操作需要批准）时弹通知：`pwsh 想执行一条命令，需要你确认权限`
@@ -322,3 +324,7 @@ test/                自检
 Node 按**真实路径**解析插件内部的裸导入，`@deepseek-ai/schemastery` 会从本目录往上找；
 没有这个联接，插件在加载期就会 `ERR_MODULE_NOT_FOUND`。`package.json` 的 `files` 白名单
 不包含 `node_modules`，所以它不会被当成包内容发布。
+
+## License
+
+[MIT](LICENSE) © 2026 Aina_PJAR ([@airenburen](https://github.com/airenburen))
