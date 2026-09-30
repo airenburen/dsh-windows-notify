@@ -1,0 +1,6 @@
+# dsh-windows-notify 的 profile 挂载层。
+# 加载器读到这里会插入一个 loader entry；该包的宿主半边（lib/index.js）随
+# entry 一起启动，负责监听会话状态、弹 Windows 原生通知、注册 notify_user 工具。
+- insert:
+    - id: windows-notify
+      name: 'dsh-windows-notify'

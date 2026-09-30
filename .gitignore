@@ -1,0 +1,15 @@
+# 依赖：桌面 profile 里那个 node_modules 是指向 profile 的 junction，
+# 绝不能进仓库（会拖进整个 profile 的依赖树）。
+node_modules/
+
+# 运行期产物
+*.log
+decision.log
+dsh-notify-*.png
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
