@@ -261,6 +261,7 @@ ok('模块导出 name / Config / apply');
   ok('ctx.windowsNotify.send 可用');
 
   assert.deepEqual(routes.map((route) => route.path).sort(), [
+    '/plugins/dsh-windows-notify/clear',
     '/plugins/dsh-windows-notify/config',
     '/plugins/dsh-windows-notify/decision',
     '/plugins/dsh-windows-notify/decisions',
