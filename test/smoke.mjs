@@ -13,6 +13,7 @@
  */
 
 import assert from 'node:assert/strict';
+import { join } from 'node:path';
 
 const { apply, Config, name, isForegroundReport } = await import('../lib/index.js');
 const { isPrivilegedApproval } = await import('../lib/messages.js');
@@ -104,6 +105,7 @@ function makeExchange(method, body, options = {}) {
   const chunks = body === undefined ? [] : [Buffer.from(JSON.stringify(body), 'utf8')];
   const req = {
     method,
+    headers: options.origin === undefined ? {} : { origin: options.origin },
     socket: {
       remoteAddress: options.remoteAddress ?? '127.0.0.1',
       localAddress: options.localAddress ?? '127.0.0.1',
@@ -699,7 +701,7 @@ ok('模块导出 name / Config / apply');
   assert.equal(outcome, 'rejected');
   assert.equal(sent.length, 1);
   assert.equal(sent[0].actions, undefined, '关掉按钮时通知里没有 actions');
-  assert.equal(sent[0].tag, 'dsh-approval');
+  assert.match(sent[0].tag, /^dsh-approval/, 'tag 是审批派生的（带时间片，无 callId 时）');
   ok('decisionButtons=false：退回普通通知，审批仍按原流程走');
 }
 {
@@ -773,12 +775,16 @@ ok('模块导出 name / Config / apply');
 }
 {
   assert.equal(isPrivilegedApproval({ requestedMode: 'danger-full-access' }), true);
-  assert.equal(isPrivilegedApproval({ justification: 'escalate sandbox to danger-full-access: 测试' }), true);
+  // 理由文本不再参与判定（#2）：文本匹配会漏判，宁多拦不漏放——只有模式字段算数。
+  assert.equal(isPrivilegedApproval({ justification: 'escalate sandbox to danger-full-access: 测试' }), false, '文本提及不算高危');
   assert.equal(isPrivilegedApproval({ requestedMode: 'workspace-write' }), false);
   assert.equal(isPrivilegedApproval({ requestedMode: 'read-only' }), false);
   assert.equal(isPrivilegedApproval({}), false, '字段缺失不能误判成高危');
   assert.equal(isPrivilegedApproval(undefined), false);
-  ok('A：高危判据覆盖「模式字段」与「理由文本」两种来源，缺字段不误判');
+  // 档位列表可扩展（#2）
+  assert.equal(isPrivilegedApproval({ requestedMode: 'yolo' }, ['yolo']), true, '自定义档位');
+  assert.equal(isPrivilegedApproval({ requestedMode: 'DANGER-FULL-ACCESS' }), true, '大小写不敏感');
+  ok('A：高危判据只认结构化模式字段（文本不参与），档位列表可配置');
 }
 
 // --------------------------- 前后台：DSH 在前台时只进操作中心（silent）
@@ -882,6 +888,180 @@ ok('模块导出 name / Config / apply');
   ok('前后台 TTL：心跳超过 45 秒就当后台（fail-open）');
 }
 
+// ------------------------------ tag 唯一化：多会话同时出错/结束不被去重吞掉（#4/#5）
+{
+  const made = makeCtx();
+  const sent = [];
+  apply(made.ctx, volatileConfig({ dedupeMs: 60000, notifyTurnEnd: true, maxPerMinute: 100 }), {
+    showWindowsToast: async (options) => { sent.push(options); return { ok: true }; },
+    resolveClickTarget: async () => APP_TARGET,
+    detectLauncher: () => ({ kind: 'none', label: '' }),
+    toastAvailability: () => ({ available: true, reason: 'ok' }),
+    ensureDecisionProtocol: async () => ({ ok: true, changed: false, script: 'test' }),
+  });
+  // 两个不同会话同时出错：两条都要弹（旧版固定 tag 会吞掉第二条）
+  made.handlers.get('agent/error')[0]({ error: new Error('boom A'), agent: { id: 'session-a' } });
+  made.handlers.get('agent/error')[0]({ error: new Error('boom B'), agent: { id: 'session-b' } });
+  await settle();
+  assert.equal(sent.length, 2, '两个会话同时出错 = 两条通知');
+  assert.notEqual(sent[0].tag, sent[1].tag, 'tag 必须不同');
+  assert.match(sent[0].tag, /^dsh-error/);
+  // 同一会话同一错误短时间内重复 → 去重仍然生效（不刷屏）
+  made.handlers.get('agent/error')[0]({ error: new Error('boom A'), agent: { id: 'session-a' } });
+  await settle();
+  assert.equal(sent.length, 2, '同会话同错误仍被去重');
+  // 两个会话同时 turn-end：两条
+  made.handlers.get('agent/turn-stopping')[0]({ agent: { id: 'session-a' } });
+  made.handlers.get('agent/turn-stopping')[0]({ agent: { id: 'session-b' } });
+  await settle();
+  assert.equal(sent.length, 4, '两个会话同时结束 = 两条通知');
+  assert.notEqual(sent[2].tag, sent[3].tag);
+  // 高危审批（无按钮路径）的固定 tag 也不能吞掉第二条：tag 带 callId 派生
+  const approval = made.handlers.get('approval/request')[0];
+  await approval({ toolName: 'pwsh', requestedMode: 'danger-full-access', callId: 'c1' }, async () => 'rejected');
+  await approval({ toolName: 'pwsh', requestedMode: 'danger-full-access', callId: 'c2' }, async () => 'rejected');
+  await settle();
+  const approvalTags = sent.slice(4).map((item) => item.tag);
+  assert.equal(approvalTags.length, 2, '两个高危审批 = 两条通知');
+  assert.notEqual(approvalTags[0], approvalTags[1], '高危审批的 tag 也不能相同');
+  ok('tag 唯一化：多会话出错/结束/多审批互不吞，同会话同错误仍去重');
+}
+
+// ------------------------------ 通道失败退避：60 秒内不反复空跑注册（#8）
+{
+  const made = makeCtx();
+  let protoCalls = 0;
+  apply(made.ctx, volatileConfig({ dedupeMs: 0, decisionSeconds: 1 }), {
+    showWindowsToast: async () => ({ ok: true }),
+    resolveClickTarget: async () => APP_TARGET,
+    detectLauncher: () => ({ kind: 'none', label: '' }),
+    toastAvailability: () => ({ available: true, reason: 'ok' }),
+    ensureDecisionProtocol: async () => { protoCalls += 1; return { ok: false, reason: 'registry denied' }; },
+  });
+  // 第一次 hello：注册失败（at 记下）
+  await learnOrigin(made);
+  const first = protoCalls;
+  assert.ok(first >= 1, '第一次尝试注册');
+  // 立刻再来一次 hello：退避期内不再空跑
+  const hello = made.routes.find((item) => item.path.endsWith('/hello'));
+  const exchange = makeExchange('POST');
+  await hello.handler(exchange.req, exchange.res);
+  assert.equal(protoCalls, first, '退避期内不重复注册');
+  // status 里能看到下次重试时间
+  const status = await made.services.get('windowsNotify').status();
+  assert.equal(status.decision.status, 'failed');
+  assert.ok(typeof status.decision.retryInMs === 'number' && status.decision.retryInMs > 0, 'retryInMs > 0');
+  ok('通道失败退避：60 秒内不空跑，/status 暴露 retryInMs');
+}
+
+// ------------------------------ decisions 落盘：重启后 seq 不回退（#10）
+{
+  const os = await import('node:os');
+  const saved = process.env.LOCALAPPDATA;
+  process.env.LOCALAPPDATA = join(os.tmpdir(), 'dsh-wn-ledger-' + String(Date.now()));
+  try {
+    const sent = [];
+    const common = {
+      showWindowsToast: async (options) => { sent.push(options); return { ok: true }; },
+      resolveClickTarget: async () => APP_TARGET,
+      detectLauncher: () => ({ kind: 'none', label: '' }),
+      toastAvailability: () => ({ available: true, reason: 'ok' }),
+      ensureDecisionProtocol: async () => ({ ok: true, changed: false, script: 't' }),
+      removeWindowsToast: async () => ({ ok: true }),
+    };
+    // 第一次「进程」：一次从通知按钮结算
+    const made1 = makeCtx();
+    apply(made1.ctx, volatileConfig({ dedupeMs: 0 }), common);
+    await learnOrigin(made1);
+    const pending1 = made1.handlers.get('approval/request')[0]({ toolName: 'pwsh', callId: 'c1' }, () => new Promise(() => {}));
+    await settle();
+    const token1 = /allow\/([0-9a-f]{16})/.exec(sent[0].actions[0].arguments)[1];
+    const decisionRoute = made1.routes.find((item) => item.path.endsWith('/decision'));
+    const click = makeExchange('POST');
+    click.req.url = `/plugins/dsh-windows-notify/decision?token=${token1}&choice=allow`;
+    await decisionRoute.handler(click.req, click.res);
+    assert.equal(await pending1, 'allowed-once');
+
+    // 第二次「进程」：apply 时应从账本恢复 seq=1（不回退到 0）
+    const made2 = makeCtx();
+    apply(made2.ctx, volatileConfig({ dedupeMs: 0 }), common);
+    const feed = makeExchange('GET');
+    await made2.routes.find((item) => item.path.endsWith('/decisions')).handler(feed.req, feed.res);
+    const feedBody = JSON.parse(feed.captured.body);
+    assert.equal(feedBody.seq, 1, `重启后 seq 延续（实际 \${feedBody.seq}）`);
+    assert.equal(feedBody.items.length, 1, '恢复最近的事实');
+    assert.equal(feedBody.items[0].callId, 'c1');
+    ok('decisions 落盘：重启后 seq 不回退、事实可恢复');
+  } finally {
+    if (saved === undefined) delete process.env.LOCALAPPDATA;
+    else process.env.LOCALAPPDATA = saved;
+  }
+}
+
+// ------------------------------ sessionFilter：只对匹配的会话弹状态通知（#13）
+{
+  const made = makeCtx();
+  const sent = [];
+  apply(made.ctx, volatileConfig({ dedupeMs: 0, sessionFilter: ['dsh-windows-notify'], notifyTurnEnd: true }), {
+    showWindowsToast: async (options) => { sent.push(options); return { ok: true }; },
+    resolveClickTarget: async () => APP_TARGET,
+    detectLauncher: () => ({ kind: 'none', label: '' }),
+    toastAvailability: () => ({ available: true, reason: 'ok' }),
+    ensureDecisionProtocol: async () => ({ ok: true, changed: false, script: 'test' }),
+  });
+  // 匹配（cwd 末段）→ 弹
+  made.handlers.get('agent/error')[0]({ error: new Error('x'), agent: { session: { header: { cwd: 'D:\\proj\\dsh-windows-notify' } } } });
+  await settle();
+  assert.equal(sent.length, 1, '匹配的会话照常弹');
+  // 不匹配 → 不弹
+  made.handlers.get('agent/error')[0]({ error: new Error('x'), agent: { session: { header: { cwd: 'D:\\proj\\other' } } } });
+  await settle();
+  assert.equal(sent.length, 1, '不匹配的会话被过滤');
+  // 显式通知不受过滤影响
+  await made.services.get('windowsNotify').send({ title: '点名提醒' });
+  assert.equal(sent.length, 2, '显式通知（notify_user/HTTP）不受 sessionFilter 影响');
+  // 空列表 = 不过滤
+  const made2 = makeCtx();
+  const sent2 = [];
+  apply(made2.ctx, volatileConfig({ dedupeMs: 0, sessionFilter: [] }), {
+    showWindowsToast: async (options) => { sent2.push(options); return { ok: true }; },
+    resolveClickTarget: async () => APP_TARGET,
+    detectLauncher: () => ({ kind: 'none', label: '' }),
+    toastAvailability: () => ({ available: true, reason: 'ok' }),
+    ensureDecisionProtocol: async () => ({ ok: true, changed: false, script: 'test' }),
+  });
+  made2.handlers.get('agent/error')[0]({ error: new Error('x'), agent: { session: { header: { cwd: 'D:\\anywhere' } } } });
+  await settle();
+  assert.equal(sent2.length, 1, '空 sessionFilter = 不过滤');
+  ok('sessionFilter：按 cwd/标题过滤状态通知，显式通知豁免');
+}
+
+// ------------------------------ privilegedModes：高危档位可配置（#2）
+{
+  const made = makeCtx();
+  const sent = [];
+  apply(made.ctx, volatileConfig({ dedupeMs: 0, privilegedModes: ['danger-full-access', 'yolo-mode'] }), {
+    showWindowsToast: async (options) => { sent.push(options); return { ok: true }; },
+    resolveClickTarget: async () => APP_TARGET,
+    detectLauncher: () => ({ kind: 'none', label: '' }),
+    toastAvailability: () => ({ available: true, reason: 'ok' }),
+    ensureDecisionProtocol: async () => ({ ok: true, changed: false, script: 'test' }),
+    removeWindowsToast: async () => ({ ok: true }),
+  });
+  await learnOrigin(made);
+  const approval = made.handlers.get('approval/request')[0];
+  // 自定义档位 yolo-mode 也不给按钮
+  void approval({ toolName: 'pwsh', requestedMode: 'yolo-mode' }, () => new Promise(() => {}));
+  await settle();
+  assert.equal(sent[0].actions, undefined, 'privilegedModes 里的自定义档位不给按钮');
+  assert.match(sent[0].body, /界面确认/);
+  // 理由文本里写 danger-full-access 不再触发高危判定（结构化字段优先）
+  void approval({ toolName: 'pwsh', requestedMode: 'workspace-write', justification: 'escalate to danger-full-access because X' }, () => new Promise(() => {}));
+  await settle();
+  assert.equal(sent[1].actions.length, 2, '只有模式字段参与高危判定：文本提及不算高危');
+  ok('privilegedModes：档位列表可配置，判定只认结构化模式字段');
+}
+
 // ------------------------------------------------------------ 去重 / 限流 / 焦点
 {
   const sent = [];
@@ -904,6 +1084,59 @@ ok('模块导出 name / Config / apply');
   assert.equal(third.skipped, 'rate-limited', '超过每分钟上限被限流');
   assert.equal(sent.every((options) => options.launch === undefined), true, 'focusOnClick=false 时不带协议激活');
   ok('去重 / 每分钟限流 / 关闭点击回 DSH');
+}
+
+// --------------------------------------------- 统一安全门：回环 + Origin 校验（#1）
+{
+  const made = makeCtx();
+  apply(made.ctx, volatileConfig({ dedupeMs: 0 }), {
+    showWindowsToast: async (options) => { sent1.push(options); return { ok: true }; },
+    resolveClickTarget: async () => APP_TARGET,
+    detectLauncher: () => ({ kind: 'none', label: '' }),
+    toastAvailability: () => ({ available: true, reason: 'ok' }),
+    ensureDecisionProtocol: async () => ({ ok: true, changed: false, script: 'test' }),
+  });
+  const sent1 = [];
+  const sendRoute = made.routes.find((route) => route.path.endsWith('/send'));
+
+  // 回环 + 无 Origin（curl / PowerShell / 宿主内转发）→ 放行
+  const plain = makeExchange('POST', { title: '脚本通知' });
+  await sendRoute.handler(plain.req, plain.res);
+  assert.equal(plain.captured.status, 200, '无 Origin 的本机脚本调用放行');
+
+  // 回环 + 本机 Origin（页面自身）→ 放行
+  const localOrigin = makeExchange('POST', { title: '页面通知' }, { origin: 'http://127.0.0.1:19387' });
+  await sendRoute.handler(localOrigin.req, localOrigin.res);
+  assert.equal(localOrigin.captured.status, 200, '本机 Origin 放行');
+
+  // 回环 + 跨源 Origin（浏览器 CSRF）→ 403，且不发通知
+  const before = sent1.length;
+  const evil = makeExchange('POST', { title: 'DSH 需要你的授权（伪造）' }, { origin: 'https://evil.example' });
+  await sendRoute.handler(evil.req, evil.res);
+  assert.equal(evil.captured.status, 403, '跨源 Origin 拒绝');
+  assert.equal(sent1.length, before, '被拒的请求不产生通知');
+  const evilBody = JSON.parse(evil.captured.body);
+  assert.match(evilBody.error, /cross-origin/, '错误信息说明原因');
+
+  // file:// Origin（Electron 老页面基）→ 放行
+  const fileOrigin = makeExchange('POST', { title: 'file 基' }, { origin: 'null' });
+  await sendRoute.handler(fileOrigin.req, fileOrigin.res);
+  assert.equal(fileOrigin.captured.status, 200, 'Origin: null（file://）放行');
+
+  // 非回环 IP → 403（此前 /send 是漏的）
+  const remote = makeExchange('POST', { title: 'x' }, { remoteAddress: '192.168.1.5' });
+  await sendRoute.handler(remote.req, remote.res);
+  assert.equal(remote.captured.status, 403, '非回环直接拒绝');
+  ok('统一安全门：/send 回环+Origin 校验（跨源 403 / 本机与无 Origin 放行）');
+
+  // /status、/recent、/decisions 这些此前无校验的读接口同样被门住
+  for (const suffix of ['status', 'recent', 'decisions']) {
+    const route = made.routes.find((item) => item.path.endsWith('/' + suffix));
+    const evilRead = makeExchange('GET', undefined, { origin: 'https://evil.example' });
+    await route.handler(evilRead.req, evilRead.res);
+    assert.equal(evilRead.captured.status, 403, `/\${suffix} 跨源也拒绝`);
+  }
+  ok('统一安全门：读接口（status/recent/decisions）一并覆盖');
 }
 
 // -------------------------------------------------------------- 非 Windows 平台
