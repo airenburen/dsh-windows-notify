@@ -23,8 +23,15 @@
 | 会话出错 | `agent/error` | 开 |
 
 同类通知会按 `tag` 互相替换，并有去重（同一 tag 4 秒内不重复）与限流（默认每分钟 20 条），
-避免刷屏；但**带按钮的权限通知每条一个独立 tag**——两个待你回答的审批必须是两条通知，
-否则会互相覆盖、没法分别回答。
+避免刷屏。**tag 的分配规则**：
+
+- **带按钮的权限通知**：每条一个独立 tag（`ap-<token 前 8 位>`）——两个待你回答的审批
+  必须是两条通知，否则会互相覆盖、没法分别回答；
+- **不带按钮的审批**（高危走界面那条）：带 `callId` 时按它派生（并发审批互不吞），
+  没有 `callId` 时用固定 tag（短窗内的同类审批合并，不刷屏）；
+- **回合结束**：tag 带会话标识——两个会话同时结束是两条通知，不会互相吞；
+- **出错**：tag 带会话标识 + 错误指纹（FNV-1a）——不同错误各占一条，同一会话同一错误
+  仍被去重。
 
 ## 安装
 
@@ -105,6 +112,8 @@ node tools/install-desktop.mjs
 | `decisionButtons` | `true` | 权限通知带「允许 / 拒绝」按钮 |
 | `decisionSeconds` | `300` | 按钮可点窗口（也会写进通知的显示时限）；`0` = 跟随 `displaySeconds` |
 | `decisionButtonsFor` | `safe-only` | 哪些审批带按钮：`safe-only` = 高危的 `danger-full-access` **不发按钮**（只提示去界面确认），`all` = 全都发 |
+| `privilegedModes` | `['danger-full-access']` | 哪些权限模式算「高危」（不给通知按钮）。DSH 未来引入新特权档位时把名字加进来。判定**只认权限模式本身**，理由文本不参与 |
+| `sessionFilter` | `[]`（不过滤） | 只对匹配的会话弹状态通知（审批/提问/回合结束/出错）。匹配会话标题或 cwd 末段（大小写不敏感的包含匹配），如 `['dsh-windows-notify', '猫窝']`。**显式通知（`notify_user`/HTTP）不受过滤** |
 | `whenFocused` | `silent` | **DSH 在前台时**怎么办：`silent` = 只进操作中心（`SuppressPopup`：不弹横幅、不响铃）、`skip` = 完全不发（历史仍记录）、`notify` = 照常弹。只作用于自动状态通知，`notify_user`/HTTP 的显式通知照常弹 |
 | `language` | `zh` | `zh` / `en` |
 | `aumid` | `com.deepseek.dsh` | 通知来源 AppUserModelID（桌面版开始菜单里的 AppID） |
@@ -122,6 +131,12 @@ node tools/install-desktop.mjs
 「前台」= `visibilityState === 'visible' && document.hasFocus()`；宿主侧 **45 秒**
 （`FOCUS_TTL_MS`）收不到消息就当作后台——页面关掉、崩溃、换机器都不会把通知永久压住。
 多窗口各报各的，取「有一个在前台」。
+
+**离开类事件强制报后台**：`pagehide`（页面关闭/跳转）与 `visibilitychange → hidden`
+（最小化、锁屏）触发时**跳过计算**直接上报 `focused: false`（带 `keepalive`，页面卸载后
+请求仍能发出）——这两类事件触发瞬间 `hasFocus()` 可能仍返回 true，按计算结果报会把
+「已离开」误报成「在前台」。锁屏时页面转入 hidden → 通知恢复弹横幅，符合「人不在电脑前」
+的直觉（真机锁屏行为建议升级后手动确认一次）。
 
 命中前台时按 `whenFocused` 处理：
 
@@ -190,6 +205,22 @@ Windows 里两件事是分开的：`duration` 只决定**横幅**在屏幕上停
 安全性：token 16 位十六进制随机、只能用一次；回传口只认回环地址；即使 token 泄漏，最坏结果
 也只是替你答了一次本来就在等你的审批，而它同时仍受 DSH 自己的授权策略约束。
 
+### HTTP 接口的统一安全门
+
+**所有** `/plugins/dsh-windows-notify/*` 路由（不只是写入口）都先过两道检查：
+
+1. **回环限定**——非 `127.0.0.1`/`::1` 的请求一律 403；
+2. **Origin 校验**——浏览器发起的跨源请求必带 `Origin` 头；不是本机来源（`http://127.0.0.1:*"`、
+   `http://localhost:*`）也不是 `null`（file:// 基）的一律 403。没有 Origin 的调用
+   （curl、PowerShell、宿主进程内的 Electron 转发）不受影响。
+
+背景：浏览器里任何网页都可以向 `http://127.0.0.1:<port>/send` 发跨源 POST（简单请求不受
+CORS 预检拦截），伪造一条「DSH 需要授权」样式的通知做社工钓鱼。统一安全门把它挡掉。
+
+**威胁模型备案**：`%LOCALAPPDATA%dsh-windows-notify` 下的回传脚本（decision.ps1、ps-worker.ps1）
+对本机其他进程可写——但本机恶意进程本来就能直接发 toast / 读注册表，本插件不假设
+「本机已失陷」场景。
+
 **高危审批默认不发按钮**（`decisionButtonsFor = safe-only`）：通知上的「允许」太容易误点，
 而 `danger-full-access` 一旦放行就不再受工作区限制。这类审批只弹一条正文带
 「高危权限，请到 DSH 界面确认」的普通通知，必须回界面点。低危的（如升级到
@@ -243,6 +274,11 @@ Invoke-RestMethod http://127.0.0.1:19387/plugins/dsh-windows-notify/status
 Invoke-RestMethod 'http://127.0.0.1:19387/plugins/dsh-windows-notify/recent?limit=10'
 # 「已从通知按钮结算」的增量事实（客户端半边用它收掉 GUI 的审批卡）
 Invoke-RestMethod 'http://127.0.0.1:19387/plugins/dsh-windows-notify/decisions?since=0'
+# 清空通知历史（侧栏「通知」页的清除按钮调它）
+Invoke-RestMethod -Method Post http://127.0.0.1:19387/plugins/dsh-windows-notify/clear
+
+# 端口说明：上面示例里的 19387 是旧版桌面端端口，**以你当前 DSH Web GUI 的实际端口为准**
+# （GUI 地址栏里就是；所有接口只接受本机回环 + 本机 Origin）。
 ```
 
 **3. 插件服务 `ctx.windowsNotify`**（其它 DSH 插件）
@@ -272,8 +308,9 @@ notify.recent(10);   // 最近发出的通知
 cd <本目录>
 node test/windows.mjs          # XML/协议/文案的单测（不需要 DSH）
 node test/windows.mjs --toast  # 额外发一条真通知，并回读操作中心历史
-node test/smoke.mjs            # 假 ctx 驱动宿主半边：4 类状态、去重限流、工具、HTTP/配置路由
-node test/client.mjs           # 假 React + 假 __ModuleLoader__ 驱动客户端半边（设置页）
+node test/smoke.mjs            # 假 ctx 驱动宿主半边：4 类状态、去重限流、安全门、tag 唯一化、
+                               # sessionFilter、privilegedModes、退避重试、decisions 落盘、card-cleanup
+node test/client.mjs           # 假 React + 假 __ModuleLoader__ 驱动客户端半边（设置页、前后台、卡片清理）
 node tools/test-decision.mjs   # 「点通知按钮 → 隐藏脚本 → POST 回宿主」端到端（真注册表协议）
 node tools/compare-define-tool.mjs   # 本地 defineTool 与 DSH 自带实现逐字段对照
 node tools/register-protocol.mjs --check   # 看 dsh-notify: 注册成了什么
@@ -292,6 +329,8 @@ node tools/test-activate.ps1   # 最小化 DSH → 触发 dsh://open → 确认�
 | 不确定是不是「自己点到的」/ 审批怎么就被批准了 | 看 `%LOCALAPPDATA%\dsh-windows-notify\decision.log`：一行一次激活，含时间、允许/拒绝、以及拉起它的父进程（真人点击 = 通知平台 `WpnUserService`；脚本触发 = `powershell.exe`）。当前默认高危审批不发按钮，也能从源头少踩这个坑 |
 | 设置页里找不到「通知」卡片 | 卡片在**设置 → 侧边栏卡片 → 侧边栏内容**一组的**最后**（`hidden` 类型排在末尾）；没有的话先确认 `dsh-better-sidebar` 在运行，客户端半边改动需要**重启宿主**才生效 |
 | 想看插件日志 | 配置 `debugLog=true`，再在会话日志里找 `windows-notify:` 前缀 |
+| 从通知点「允许/拒绝」后界面上的审批卡不消失 | 侧栏「通知」页（或 `/status` 的 `cardCleanup` 字段）：`degraded` = 客户端的文案匹配失效了（DSH 换皮/换文案），A/B 两条清理路线都没走到；`settled` = 清理动作已发出（卡还挂着就是渲染层的问题，刷新页面） |
+| 通知发送明显变慢 | 看日志里有没有 `powerShell worker`：长驻通道没起来时会回退逐条 spawn（每条冷启动几百 ms）；连续 3 次起不来本轮进程不再重试。通道失败（注册表/协议）有 60 秒退避，`/status` 的 `decision.retryInMs` 能看到下次重试还有多久 |
 
 ## 卸载
 
@@ -306,16 +345,21 @@ cd ~/.dsh/profiles/desktop
 ## 目录
 
 ```
-lib/index.js         插件宿主半边：事件监听、通知编排、按钮回传（允许/拒绝）、模型工具、
-                     HTTP 路由、配置桥、通知历史、ctx.windowsNotify
-lib/client.js        客户端半边（手写的已构建 bundle）：注册 DSH 原生设置页（settings.section）+
-                     better-sidebar 设置卡片 + plugins.row.config 兜底页；前后台上报、审批卡清理
+lib/index.js         插件宿主半边的编排层：Config、notify 主路径（去重/限流/前后台/显示时限）、
+                     PowerShell 通道（长驻 worker + 逐条 spawn 回退）、decisions 落盘、状态组装
+lib/events.js        4 类「会话状态 → 通知」的事件监听（审批竞速、tag 唯一化、sessionFilter 接线）
+lib/http-routes.js   全部 HTTP 路由 + 统一安全门（回环 + Origin）
+lib/channels.js      两条惰性注册通道（点击回 DSH / 按钮回传）+ 失败退避 + 按钮 token 记账
+lib/http.js          路由共用小工具（请求体解析 / JSON 回写 / 回环判定）
+lib/client.js        客户端半边（手写的已构建 bundle）：设置面板、better-sidebar 卡片、
+                     前后台上报（pagehide/hidden 强制后台）、审批卡清理（结果上报宿主）
 lib/win-toast.js     WinRT Toast 发送器（Windows PowerShell 5.1 + -EncodedCommand）+ 撤下通知
 lib/protocol.js      点击目标 / 按钮回传的协议推导与注册（dsh://open 优先，dsh-notify: 兜底）
-lib/messages.js      4 类状态的文案与载荷防御式解析（zh/en）
+lib/messages.js      4 类状态的文案与载荷防御式解析（zh/en）+ 高危审批判定
 lib/define-tool.js   defineTool 的等价实现（避免依赖 @deepseek-ai/dsh-tools 的裸导入解析）
 cordis.patch.yml     profile 挂载层（insert 一个 loader entry）
-tools/               安装、协议注册、按钮链路端到端、defineTool 对照、激活测试、演示通知
+tools/               安装、协议注册、按钮链路端到端、defineTool 对照、激活测试、演示通知、
+                     ps-worker.ps1（长驻 toast worker）
 test/                自检
 ```
 
