@@ -161,28 +161,28 @@ assert.equal(typeof tab.settings?.render, 'function', '齿轮里的自定义面�
 assert.equal(typeof tab.component, 'function');
 ok('有 better-sidebar：设置搬进它的设置页（registerTab + settings.render），行配置页被撤下');
 
-// ------------------------- 原生设置页：设置 → 左侧导航多一格「通知」（同 dsh-market）
+// ------------------------- 设置左导航那一格已经收进 dsh-Aina-settings-hub
 {
+  // 本模块**刻意不再注册** settings.section：那一格由枢纽包统一提供，它 require 本模块、
+  // 取 __panel.ConfigPanel 放进「管家 → 通知」标签。重复注册会让设置里出现两个入口。
   const section = withSidebar.registrations.find((item) => item.slot === 'settings.section');
-  assert.ok(section !== undefined, '应注册一格 settings.section');
-  assert.equal(section.definition.id, 'dsh-windows-notify', '用自己的 id（复用别人的会顶掉对方那一页）');
-  assert.equal(section.definition.order, 55, '排在插件市场 (40) 之后');
-  assert.equal(typeof section.definition.label, 'function');
-  assert.ok(['通知', 'Notifications'].includes(section.definition.label()), `导航文案应是本地化的，实际 ${section.definition.label()}`);
+  assert.equal(section, undefined, '不再自己注册 settings.section（已收进枢纽）');
 
-  const rendered = renderElement(section.component({ close: () => {} }), { status: 'ready', value: { enabled: true }, revision: 1, error: undefined, busy: false, note: undefined });
-  const renderedJson = JSON.stringify(rendered);
-  assert.equal(renderedJson.includes('发送测试通知') || renderedJson.includes('Send test toast'), true, '是同一块配置面板');
-  assert.equal(renderedJson.includes('Windows 通知') || renderedJson.includes('Windows notifications'), true, '整页形态带标题');
-  ok('原生设置页：settings.section 注册（id/order/label + 渲染配置面板）');
+  // 交给枢纽的那块面板必须真的可调用、且是同一份实现。
+  assert.ok(clientModule.__panel !== undefined, '应导出 __panel 供枢纽复用');
+  assert.equal(typeof clientModule.__panel.ConfigPanel, 'function');
+  assert.equal(typeof clientModule.__panel.summarize, 'function', '摘要函数也一并导出');
+  assert.ok(Array.isArray(clientModule.__panel.FIELDS), '字段描述也一并导出');
+  assert.ok(clientModule.__panel.ConfigPanel({ compact: false }) !== undefined, 'ConfigPanel 可直接调用');
+  ok('设置左导航不再自己注册；改为导出 __panel 交给 dsh-Aina-settings-hub');
 }
 {
-  // 没有 better-sidebar 时，原生设置页照样要在
+  // 没有 better-sidebar 时行为一致：仍然不注册 settings.section，行配置页仍在。
   const fallback = makeClientCtx({ withBetterSidebar: false });
   clientModule.apply(fallback.ctx);
-  assert.ok(fallback.registrations.some((item) => item.slot === 'settings.section'), '不依赖 better-sidebar');
-  assert.equal(fallback.rowPages.length, 1, '行配置页也保留');
-  ok('原生设置页不依赖 better-sidebar；行配置页作为兜底仍在');
+  assert.equal(fallback.registrations.some((item) => item.slot === 'settings.section'), false, '任何情况下都不再自己注册');
+  assert.equal(fallback.rowPages.length, 1, '行配置页作为兜底仍在');
+  ok('不注册 settings.section；行配置页作为兜底仍在');
 }
 
 // ------------------------------------------------- 没有 better-sidebar：兜底
