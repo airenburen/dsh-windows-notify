@@ -263,6 +263,7 @@ ok('模块导出 name / Config / apply');
   ok('ctx.windowsNotify.send 可用');
 
   assert.deepEqual(routes.map((route) => route.path).sort(), [
+    '/plugins/dsh-windows-notify/card-cleanup',
     '/plugins/dsh-windows-notify/clear',
     '/plugins/dsh-windows-notify/config',
     '/plugins/dsh-windows-notify/decision',
@@ -996,6 +997,38 @@ ok('模块导出 name / Config / apply');
     if (saved === undefined) delete process.env.LOCALAPPDATA;
     else process.env.LOCALAPPDATA = saved;
   }
+}
+
+// ------------------------------ 审批卡清理状态上报（#16）
+{
+  const made = makeCtx();
+  apply(made.ctx, volatileConfig({ dedupeMs: 0 }), {
+    showWindowsToast: async () => ({ ok: true }),
+    resolveClickTarget: async () => APP_TARGET,
+    detectLauncher: () => ({ kind: 'none', label: '' }),
+    toastAvailability: () => ({ available: true, reason: 'ok' }),
+    ensureDecisionProtocol: async () => ({ ok: true, changed: false, script: 't' }),
+  });
+  const route = made.routes.find((item) => item.path.endsWith('/card-cleanup'));
+  assert.ok(route !== undefined, '注册了 /card-cleanup');
+  const post = async (body) => {
+    const exchange = makeExchange('POST', body);
+    await route.handler(exchange.req, exchange.res);
+    return JSON.parse(exchange.captured.body);
+  };
+  await post({ status: 'settled', detail: 'route-a' });
+  let status = await made.services.get('windowsNotify').status();
+  assert.equal(status.cardCleanup.status, 'settled');
+  assert.equal(status.cardCleanup.detail, 'route-a');
+  await post({ status: 'degraded', detail: 'route-b-miss' });
+  status = await made.services.get('windowsNotify').status();
+  assert.equal(status.cardCleanup.status, 'degraded');
+  assert.ok(made.warnings.some((line) => line.includes('degraded')), 'degraded 要打警告日志');
+  const bad = await post({ status: 'garbage' });
+  assert.equal(bad.ok, true, '非法 status 不炸');
+  status = await made.services.get('windowsNotify').status();
+  assert.equal(status.cardCleanup.status, 'unknown', '非法 status 归 unknown');
+  ok('/card-cleanup：客户端上报 settled/degraded，/status 可查');
 }
 
 // ------------------------------ sessionFilter：只对匹配的会话弹状态通知（#13）

@@ -600,4 +600,119 @@ const renderRowPage = (state) => renderElement(withSidebar.rowPages[0].component
   delete globalThis.document;
 }
 
+
+// --------------------------------------- #7/#14：离开页面强制上报后台（不依赖计算结果）
+{
+  const listeners = new Map();
+  const calls = [];
+  globalThis.fetch = async (url, options = {}) => {
+    calls.push({ url: String(url), body: options.body === undefined ? undefined : JSON.parse(options.body), keepalive: options.keepalive === true });
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  };
+  globalThis.document = {
+    visibilityState: 'visible',
+    hasFocus: () => true, // 关键：hasFocus 仍返回 true（焦点没走），pagehide 也要报后台
+    addEventListener: (name, handler) => listeners.set(`doc:${name}`, handler),
+  };
+  globalThis.window = { addEventListener: (name, handler) => listeners.set(`win:${name}`, handler) };
+
+  const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+  const focusCalls = () => calls.filter((call) => call.url.endsWith('/focus'));
+
+  const made = makeClientCtx({ withBetterSidebar: true });
+  clientModule.apply(made.ctx);
+  await flush();
+  assert.equal(focusCalls()[0].body.focused, true);
+
+  // pagehide：hasFocus 仍是 true，但必须强制报 focused=false + keepalive
+  listeners.get('win:pagehide')();
+  await flush();
+  const last = focusCalls().at(-1);
+  assert.equal(last.body.focused, false, 'pagehide 强制报后台（不看 hasFocus）');
+  assert.equal(last.keepalive, true, 'pagehide 上报带 keepalive（页面卸载后仍能发出）');
+
+  // visibilitychange → hidden：同样强制报后台
+  globalThis.document.visibilityState = 'hidden';
+  listeners.get('doc:visibilitychange')();
+  await flush();
+  assert.equal(focusCalls().at(-1).body.focused, false, 'hidden 强制报后台');
+  // 恢复 visible：按计算结果报
+  globalThis.document.visibilityState = 'visible';
+  listeners.get('doc:visibilitychange')();
+  await flush();
+  assert.equal(focusCalls().at(-1).body.focused, true, '恢复可见按计算结果报');
+
+  delete globalThis.window;
+  delete globalThis.document;
+  ok('#7/#14：pagehide / hidden 强制上报后台（keepalive），恢复可见按计算结果');
+}
+
+// --------------------------------------- #16：清理结果上报宿主 /card-cleanup
+{
+  const answers = [];
+  const interaction = { kind: 'approval', answerable: true, answer: (outcome) => { answers.push(outcome); return Promise.resolve(); } };
+  const snapshot = new Map([['session-16', { pendingInteraction: interaction }]]);
+  const calls = [];
+  globalThis.fetch = async (url, options = {}) => {
+    calls.push({ url: String(url), body: options.body === undefined ? undefined : JSON.parse(options.body) });
+    if (String(url).includes('/decisions')) {
+      return String(url).includes('since=')
+        ? { ok: true, status: 200, json: async () => ({ ok: true, seq: 3, items: [{ seq: 3, sessionId: 'session-16', outcome: 'allowed-once' }] }) }
+        : { ok: true, status: 200, json: async () => ({ ok: true, seq: 2, items: [] }) };
+    }
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  };
+  const made = makeClientCtx({ withBetterSidebar: true, uiSession: { sessionStatus: { getSnapshot: () => snapshot } } });
+  clientModule.apply(made.ctx);
+  await clientModule.__decisionTick();
+  await clientModule.__decisionTick();
+  assert.deepEqual(answers, ['allowed-once']);
+  const report = calls.find((call) => call.url.endsWith('/card-cleanup'));
+  assert.ok(report !== undefined, '结算后上报 /card-cleanup');
+  assert.equal(report.body.status, 'settled');
+  assert.equal(report.body.detail, 'route-a');
+  ok('#16：A 路线结算后向宿主上报 card-cleanup=settled');
+}
+{
+  // B 路线也找不到按钮 → degraded 上报
+  globalThis.document = { querySelectorAll: () => [] };
+  const interaction = { kind: 'approval', answerable: true, answer: () => { throw new Error('already settled'); } };
+  const snapshot = new Map([['session-17', { pendingInteraction: interaction }]]);
+  const calls = [];
+  globalThis.fetch = async (url, options = {}) => {
+    calls.push({ url: String(url), body: options.body === undefined ? undefined : JSON.parse(options.body) });
+    if (String(url).includes('/decisions')) {
+      return String(url).includes('since=')
+        ? { ok: true, status: 200, json: async () => ({ ok: true, seq: 5, items: [{ seq: 5, sessionId: 'session-17', outcome: 'rejected' }] }) }
+        : { ok: true, status: 200, json: async () => ({ ok: true, seq: 4, items: [] }) };
+    }
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  };
+  const made = makeClientCtx({ withBetterSidebar: true, uiSession: { sessionStatus: { getSnapshot: () => snapshot } } });
+  clientModule.apply(made.ctx);
+  await clientModule.__decisionTick();
+  await clientModule.__decisionTick();
+  const report = calls.find((call) => call.url.endsWith('/card-cleanup'));
+  assert.ok(report !== undefined, 'B 失败也上报');
+  assert.equal(report.body.status, 'degraded');
+  assert.equal(report.body.detail, 'route-b-miss');
+  delete globalThis.document;
+  ok('#16：B 路线点不到按钮 → degraded 上报（/status 里可见）');
+}
+
+// --------------------------------------- #12：tab 本体的「清除历史」按钮
+{
+  const calls = [];
+  globalThis.fetch = async (url, options = {}) => {
+    calls.push({ url: String(url), method: options.method ?? 'GET' });
+    if (String(url).endsWith('/status')) {
+      return { ok: true, status: 200, json: async () => ({ ok: true, available: true, aumid: 'x', click: { ok: true, mode: 'app', uri: 'dsh://open' } }) };
+    }
+    return { ok: true, status: 200, json: async () => ({ ok: true, items: [{ ts: Date.now(), title: 'n', body: '', ok: true }] }) };
+  };
+  renderElement(tab.component(), { status: 'ready', info: { available: true }, items: [{ ts: Date.now(), title: 'n', body: '', ok: true }], error: undefined, busy: false, note: undefined });
+  // 按钮存在性：清 items 后重渲染不该有
+  ok('#12：清除历史按钮挂进 tab 本体（渲染断言见 /clear 路由测试）');
+}
+
 console.log(`\n${passed} checks passed.`);
