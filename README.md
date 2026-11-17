@@ -81,12 +81,18 @@ node tools/install-desktop.mjs
 
 ## 配置
 
-**主入口：设置 → 左侧导航「通知」**（DSH 原生设置页，order 55，排在「插件市场」后面）。
+**主入口：设置 → 左侧导航「管家」→ 顶部「通知」标签**。
 
-> 这是 DSH 自己的槽位机制：客户端半边注册一格
-> `settings.section`（`{ id: 'dsh-windows-notify', order: 55, label }`）就多一页 ——
-> `dsh-market` 的「插件市场」页是同一套做法。**用自己的 id**：复用别人的 id 会把对方那一页顶掉。
-> 这一格不依赖任何第三方插件，better-sidebar 卸了也照样在。
+> 这一格由 [dsh-Aina-settings-hub](https://github.com/airenburen/dsh-Aina-settings-hub)（「管家」）
+> 统一提供：它在 `settings.section` 里注册一格，页内顶部是
+> 通知 / 截图管家 / 附件回收 三个标签，点「通知」才渲染本插件的面板。
+>
+> 面板不是复制过去的：枢纽 `require('dsh-windows-notify')` 后取本模块导出的
+> `__panel.ConfigPanel` 直接渲染成 `<ConfigPanel compact={false} />`。所以以后改这一份
+> `lib/client.js`，枢纽里的「通知」标签跟着变，不存在两份要同步的 UI 代码。
+>
+> **本插件自己刻意不再注册 `settings.section`**：枢纽那格与自注册那格会并存，
+> 设置里就会看到两个入口。缺了枢纽的部署，面板从下面两处入口照样进得去。
 
 **另一处入口：设置 → 侧边栏卡片 → 找到「通知」卡片 → 卡片上的齿轮**（DSH-better-sidebar 的设置页）。
 
@@ -99,7 +105,22 @@ node tools/install-desktop.mjs
 > 没装 better-sidebar 的部署会**自动退回**插件行配置页（侧栏「插件」→ 已安装 →
 > `dsh-windows-notify` → 行上的「配置」）。三处入口共用同一个面板与同一份配置。
 
-面板里的字段（全部 `.volatile()`，改完立即生效）：
+面板按用途分四组，一组一张卡片（分组定义在 `lib/client.js` 的 `SECTIONS`，与
+`__panel.SECTIONS` 同一份）：
+
+| 分组 | 收什么 |
+| --- | --- |
+| **通知场景** | `enabled` / `notifyApproval` / `notifyQuestion` / `notifyTurnEnd` / `notifyError` / `notifySubagents` —— 什么时候弹 |
+| **点击与审批** | `focusOnClick` / `decisionButtons` / `decisionButtonsFor` / `decisionSeconds` —— 点了之后发生什么 |
+| **显示与格式** | `whenFocused` / `displaySeconds` / `sticky` / `sound` / `language` —— 停留多久、怎么提醒 |
+| **高级** | `agentTool` / `httpApi` / `aumid` / `dedupeMs` / `maxPerMinute` / `debugLog` —— 装好之后一般不用动 |
+
+开关是自绘的（原生 `checkbox` 在深色主题下是发白方块、也对不齐基线），带
+`role="switch"` / `aria-checked`，整行可点、键盘空格与回车也能切换；配色只用
+`currentColor` 与半透明灰，**不假定面板背景是亮还是暗**（它要嵌进 DSH 设置页，也会被
+管家枢纽以 `compact={false}` 复用）。
+
+字段（全部 `.volatile()`，改完立即生效）：
 
 | 字段 | 默认 | 说明 |
 | --- | --- | --- |

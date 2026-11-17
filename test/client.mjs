@@ -297,6 +297,24 @@ const renderRowPage = (state) => renderElement(withSidebar.rowPages[0].component
   ok(`better-sidebar 面板：${ALL_KEYS.length} 个字段 + 测试按钮（含显示时间限制）`);
 }
 {
+  // 面板按分组渲染：字段的 group 必须对上某个 SECTIONS.id，否则它会安静地消失
+  // （filter 找不到归属 → 一条都不渲染，而字段清单测试仍然是 21 个，看不出来）。
+  const sections = clientModule.__panel.SECTIONS;
+  assert.ok(Array.isArray(sections) && sections.length === 4, '应有 4 个分组');
+  const ids = sections.map((section) => section.id);
+  const orphans = clientModule.__panel.FIELDS.filter((field) => !ids.includes(field.group));
+  assert.deepEqual(orphans.map((field) => field.key), [], '每个字段都必须挂在某个分组下');
+  const grouped = new Set(clientModule.__panel.FIELDS.map((field) => field.group));
+  assert.equal(grouped.size, ids.length, '每个分组都应有字段，不应有空分组');
+
+  const { items } = renderSidebarPanel(READY_STATE);
+  const shown = texts(items);
+  for (const section of sections) {
+    assert.ok(shown.includes(section.title[0]), `分组标题「${section.title[0]}」应出现在面板里`);
+  }
+  ok('面板分组：4 组都渲染出来，21 个字段各有归属');
+}
+{
   const calls = [];
   globalThis.fetch = async (url, options = {}) => {
     calls.push({ url, method: options.method ?? 'GET', body: options.body === undefined ? undefined : JSON.parse(options.body) });
