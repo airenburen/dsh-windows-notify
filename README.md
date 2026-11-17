@@ -22,6 +22,11 @@
 | 一轮回复结束 | `agent/turn-stopping` | 关（`notifyTurnEnd` 打开） |
 | 会话出错 | `agent/error` | 开 |
 
+> **子智能体不单独打扰**：`agent/turn-stopping` / `agent/error` 对每个 agent（含 subagent）都会派发，
+> 但默认只在**根会话**上弹——子agent的通知跟着父会话走，避免一个父任务并发拉起八个子任务时连弹八条。
+> 想让子agent也通知（比如单独盯某个子agent），把 `notifySubagents` 打开。**审批 / 提问不受此过滤**：
+> 子agent要权限、要回答时照常弹。
+
 同类通知会按 `tag` 互相替换，并有去重（同一 tag 4 秒内不重复）与限流（默认每分钟 20 条），
 避免刷屏。**tag 的分配规则**：
 
@@ -103,6 +108,7 @@ node tools/install-desktop.mjs
 | `notifyQuestion` | `true` | AI 提问时通知 |
 | `notifyTurnEnd` | `false` | 一轮回复结束时通知 |
 | `notifyError` | `true` | 会话出错时通知 |
+| `notifySubagents` | `false` | 子agent（subagent / fork 出的会话）也走 turn-end / 出错通知。审批、提问**始终**通知，不受此项影响 |
 | `agentTool` | `true` | 注册 `notify_user` 工具（改后需重载插件） |
 | `httpApi` | `true` | 开启 `/plugins/dsh-windows-notify/*` 路由 |
 | `focusOnClick` | `true` | 点击通知回到 DSH |
@@ -175,8 +181,12 @@ Windows 里两件事是分开的：`duration` 只决定**横幅**在屏幕上停
 1. 审批通知渲染成 `<actions>` 里两个按钮：`dsh-notify:allow/<16位随机token>` /
    `dsh-notify:reject/<token>`，按钮配色用 `hint-button-style`（允许=Success / 拒绝=Critical），
    点通知正文仍然是回到 DSH（`dsh://open`）。
-2. 插件把宿主半边注册的 `dsh-notify:` 协议指向一个隐藏 PowerShell 启动器
-   （`%LOCALAPPDATA%\dsh-windows-notify\decision.ps1`）——它把 URI 解析成
+2. 插件把宿主半边注册的 `dsh-notify:` 协议指向一个**无窗口启动链**：
+   `wscript.exe → decision-launch.vbs → decision.ps1`（都在
+   `%LOCALAPPDATA%\dsh-windows-notify\`）。中间垫一层 VBS 是必须的——直接用
+   `powershell.exe -WindowStyle Hidden` 注册时，PS5.1 控制台宿主会**先建窗口再隐藏**，
+   每次点按钮都闪一下黑框；`wscript` 以 `shell.Run ..., 0, False` 拉起 PowerShell 则从头到尾
+   没有窗口。`decision.ps1` 把 URI 解析成
    `POST <宿主地址>/plugins/dsh-windows-notify/decision?token=…&choice=allow|reject`。
    这条通道**独立于**回 DSH 用的 `dsh:` 协议，所以两边互不影响。
    启动器脚本里要写死宿主地址，而这个地址**只能从请求上取**：`webServer` 服务不暴露端口，
@@ -354,7 +364,8 @@ lib/http.js          路由共用小工具（请求体解析 / JSON 回写 / 回
 lib/client.js        客户端半边（手写的已构建 bundle）：设置面板、better-sidebar 卡片、
                      前后台上报（pagehide/hidden 强制后台）、审批卡清理（结果上报宿主）
 lib/win-toast.js     WinRT Toast 发送器（Windows PowerShell 5.1 + -EncodedCommand）+ 撤下通知
-lib/protocol.js      点击目标 / 按钮回传的协议推导与注册（dsh://open 优先，dsh-notify: 兜底）
+lib/protocol.js      点击目标 / 按钮回传的协议推导与注册（dsh://open 优先，dsh-notify: 兜底；
+                     按钮回传走 wscript + VBS 无窗启动链）
 lib/messages.js      4 类状态的文案与载荷防御式解析（zh/en）+ 高危审批判定
 lib/define-tool.js   defineTool 的等价实现（避免依赖 @deepseek-ai/dsh-tools 的裸导入解析）
 cordis.patch.yml     profile 挂载层（insert 一个 loader entry）
