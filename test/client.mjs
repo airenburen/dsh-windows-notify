@@ -85,14 +85,42 @@ assert.deepEqual(requireCalls, ['react'], '只应 require react');
 ok('bundle 格式与 factory 导出（apply / inject = [slots]）');
 
 // ---------------------------------------------------------------- 假客户端 ctx
+// 插槽注册表按宿主 `SlotRegistry` 的语义最小实现：entries / subscribe / register
+// （register 会先写 entries 再通知订阅者；注销则相反），这样「管家后到」也能被测到。
 function makeClientCtx({ withBetterSidebar, uiSession }) {
   const rowPages = [];
+  const bundlePages = [];
+  const sectionPages = [];
   const registrations = [];
   const disposed = [];
   const tabs = [];
+  const records = new Map();
+  const listeners = new Map();
   let currentSlot;
+
+  const entriesOf = (name) => {
+    if (!records.has(name)) records.set(name, []);
+    return records.get(name);
+  };
+  const notify = (name) => {
+    for (const listener of [...(listeners.get(name) ?? [])]) listener();
+  };
+  /** 模拟别的插件（管家）往某个插槽注册一条；返回注销函数。 */
+  const addEntry = (name, options) => {
+    const entry = { options, component: () => null };
+    entriesOf(name).push(entry);
+    notify(name);
+    return () => {
+      const list = entriesOf(name);
+      const index = list.indexOf(entry);
+      if (index >= 0) list.splice(index, 1);
+      notify(name);
+    };
+  };
+
   const ctx = {
     slots: {
+      addEntry,
       inject(name, callback) {
         currentSlot = name;
         try {
@@ -101,12 +129,35 @@ function makeClientCtx({ withBetterSidebar, uiSession }) {
           currentSlot = undefined;
         }
       },
-      register(definition, component) {
-        const record = { slot: definition.name ?? currentSlot, definition, component };
-        registrations.push(record);
-        if (record.slot === 'plugins.row.config') rowPages.push(record);
+      entries(name) {
+        return entriesOf(name).slice();
+      },
+      subscribe(name, listener) {
+        if (!listeners.has(name)) listeners.set(name, new Set());
+        listeners.get(name).add(listener);
         return () => {
+          listeners.get(name)?.delete(listener);
+        };
+      },
+      register(definition, component) {
+        const slot = definition.name ?? currentSlot;
+        const entry = {
+          options: { id: definition.id, key: definition.key, order: definition.order, priority: definition.priority },
+          component,
+        };
+        entriesOf(slot).push(entry);
+        const record = { slot, definition, component };
+        registrations.push(record);
+        if (slot === 'plugins.row.config') rowPages.push(record);
+        if (slot === 'plugins.bundle.config') bundlePages.push(record);
+        if (slot === 'settings.section') sectionPages.push(record);
+        notify(slot);
+        return () => {
+          const list = entriesOf(slot);
+          const index = list.indexOf(entry);
+          if (index >= 0) list.splice(index, 1);
           disposed.push(definition.key ?? definition.id);
+          notify(slot);
         };
       },
     },
@@ -133,7 +184,7 @@ function makeClientCtx({ withBetterSidebar, uiSession }) {
     };
   }
   if (uiSession !== undefined) ctx.uiSession = uiSession;
-  return { ctx, rowPages, registrations, disposed, tabs };
+  return { ctx, rowPages, bundlePages, sectionPages, registrations, disposed, tabs };
 }
 
 // --------------------------------------------------- 有 better-sidebar：搬过去
@@ -146,53 +197,106 @@ const withSidebar = makeClientCtx({ withBetterSidebar: true });
 clientModule.apply(withSidebar.ctx);
 assert.deepEqual(applyCalls, [{ url: '/plugins/dsh-windows-notify/hello', method: 'POST' }], 'apply 时应 ping 一次');
 ok('apply 时 ping /hello（宿主靠它得知自己的监听地址，按钮回传脚本要用）');
-assert.equal(withSidebar.rowPages.length, 1, '先注册兜底行配置页');
+assert.equal(withSidebar.rowPages.length, 1, '行配置页常驻，不因为装了 better-sidebar 就撤');
 assert.equal(withSidebar.rowPages[0].definition.key, 'dsh-windows-notify#windows-notify');
-assert.deepEqual(withSidebar.disposed, ['dsh-windows-notify#windows-notify'], '有 better-sidebar 时撤掉行配置页');
+assert.deepEqual(withSidebar.disposed, [], '装了 better-sidebar 也不撤任何已注册入口');
 assert.equal(withSidebar.tabs.length, 1, '注册到 better-sidebar 的 tab 表');
 const tab = withSidebar.tabs[0];
 assert.equal(tab.id, 'dsh-windows-notify');
-assert.equal(tab.hidden, true, 'hidden：不给 DSH 原生「+」菜单添乱，但设置卡片照常出现');
+assert.equal(tab.hidden, true, 'hidden：不给「+」菜单添乱；代价是不出设置卡片，所以入口不能靠它');
 assert.equal(tab.order, 900);
 assert.equal(typeof tab.title, 'function');
 assert.equal(typeof tab.title(), 'string');
 assert.equal(typeof tab.description, 'function');
-assert.equal(typeof tab.settings?.render, 'function', '齿轮里的自定义面板由 settings.render 提供');
+assert.equal(typeof tab.settings?.render, 'function', '编程打开时齿轮里的面板由 settings.render 提供');
 assert.equal(typeof tab.component, 'function');
-ok('有 better-sidebar：设置搬进它的设置页（registerTab + settings.render），行配置页被撤下');
+ok('有 better-sidebar：注册 hidden tab，同时行配置页常驻（hidden tab 不出设置卡片）');
 
-// ------------------------- 设置左导航那一格已经收进 dsh-Aina-settings-hub
+// ------------------------------------------- 入口二：包详情页（key = 包名）
 {
-  // 本模块**刻意不再注册** settings.section：那一格由枢纽包统一提供，它 require 本模块、
-  // 取 __panel.ConfigPanel 放进「管家 → 通知」标签。重复注册会让设置里出现两个入口。
-  const section = withSidebar.registrations.find((item) => item.slot === 'settings.section');
-  assert.equal(section, undefined, '不再自己注册 settings.section（已收进枢纽）');
+  assert.equal(withSidebar.bundlePages.length, 1, '包配置页也要注册');
+  assert.equal(withSidebar.bundlePages[0].definition.key, 'dsh-windows-notify', 'key 必须恰好等于包名，否则包详情页判定 configured 为假');
+  assert.equal(typeof withSidebar.bundlePages[0].component, 'function');
+  assert.ok(withSidebar.bundlePages[0].component({}) !== undefined, '包配置页组件可直接调用');
+  ok('包配置页 plugins.bundle.config 注册在包名下（不依赖 patch 里的 row id）');
+}
+
+// --------------------------------- 入口三：无管家时自注册设置左导航「通知」
+function ourSections(made) {
+  return made.ctx.slots.entries('settings.section').filter((entry) => entry.options.id === 'dsh-windows-notify');
+}
+{
+  // withSidebar 这轮 apply 时没有管家 → 应该占住「通知」这一格。
+  assert.equal(withSidebar.sectionPages.length, 1, '无管家时注册 settings.section');
+  const section = withSidebar.sectionPages[0].definition;
+  assert.equal(section.id, 'dsh-windows-notify');
+  assert.equal(section.order, 55, '排在管家(54)后面那一格');
+  assert.equal(typeof section.label, 'function');
+  assert.equal(typeof section.label(), 'string');
+  assert.ok(withSidebar.sectionPages[0].component({}) !== undefined, '设置页组件可直接调用');
 
   // 交给枢纽的那块面板必须真的可调用、且是同一份实现。
   assert.ok(clientModule.__panel !== undefined, '应导出 __panel 供枢纽复用');
   assert.equal(typeof clientModule.__panel.ConfigPanel, 'function');
   assert.equal(typeof clientModule.__panel.summarize, 'function', '摘要函数也一并导出');
   assert.ok(Array.isArray(clientModule.__panel.FIELDS), '字段描述也一并导出');
+  assert.ok(clientModule.__panel.SECTIONS !== undefined, '分组定义也一并导出');
   assert.ok(clientModule.__panel.ConfigPanel({ compact: false }) !== undefined, 'ConfigPanel 可直接调用');
-  ok('设置左导航不再自己注册；改为导出 __panel 交给 dsh-Aina-settings-hub');
-}
-{
-  // 没有 better-sidebar 时行为一致：仍然不注册 settings.section，行配置页仍在。
-  const fallback = makeClientCtx({ withBetterSidebar: false });
-  clientModule.apply(fallback.ctx);
-  assert.equal(fallback.registrations.some((item) => item.slot === 'settings.section'), false, '任何情况下都不再自己注册');
-  assert.equal(fallback.rowPages.length, 1, '行配置页作为兜底仍在');
-  ok('不注册 settings.section；行配置页作为兜底仍在');
+  ok('无管家时自己占「通知」这一格（id/order/label 齐备），继续导出 __panel 供枢纽复用');
 }
 
-// ------------------------------------------------- 没有 better-sidebar：兜底
+// ------------------------------- 管家后到（插件加载顺序不保证）：让出这一格
 {
-  const fallback = makeClientCtx({ withBetterSidebar: false });
-  clientModule.apply(fallback.ctx);
-  assert.equal(fallback.rowPages.length, 1, '没有 better-sidebar 时保留行配置页');
-  assert.equal(fallback.disposed.length, 0);
-  assert.equal(fallback.tabs.length, 0);
-  ok('没有 better-sidebar：退回插件行配置页');
+  const disposeHub = withSidebar.ctx.slots.addEntry('settings.section', { id: 'dsh-Aina-settings-hub', order: 54 });
+  assert.equal(ourSections(withSidebar).length, 0, '管家出现后必须注销自己那一格，避免两个入口');
+  assert.ok(withSidebar.disposed.includes('dsh-windows-notify'), '注销走 disposer，不是只从数组里删记录');
+  disposeHub();
+  assert.equal(ourSections(withSidebar).length, 1, '管家走了要重新占回来（订阅插槽变更，不是只看一次）');
+  ok('管家后到 → 让出设置左导航那一格；管家卸载 → 自动占回');
+}
+
+// ------------------------------ 管家先到：apply 时就直接不注册，不进再退
+{
+  const made = makeClientCtx({ withBetterSidebar: true });
+  made.ctx.slots.addEntry('settings.section', { id: 'dsh-Aina-settings-hub', order: 54 });
+  clientModule.apply(made.ctx);
+  assert.equal(made.sectionPages.length, 0, '管家已在时一次都不注册（避免注册/注销抖动）');
+  assert.equal(ourSections(made).length, 0);
+  assert.equal(made.rowPages.length, 1, '行配置页不受影响');
+  assert.equal(made.bundlePages.length, 1, '包配置页不受影响');
+  ok('管家已在时：不注册 settings.section，行页与包页照旧');
+}
+
+// ------------- 三种部署组合：每种都要有入口且设置左导航不重复
+{
+  // (1) 无管家 + 无 better-sidebar
+  const bare = makeClientCtx({ withBetterSidebar: false });
+  clientModule.apply(bare.ctx);
+  assert.equal(bare.rowPages.length, 1, '行配置页常在');
+  assert.equal(bare.bundlePages.length, 1, '包配置页常在');
+  assert.equal(bare.sectionPages.length, 1, '无管家 → 设置左导航自己占一格');
+  assert.equal(bare.tabs.length, 0, '没装 better-sidebar 就不注册 tab');
+  assert.equal(bare.disposed.length, 0);
+  ok('组合一（无管家、无 better-sidebar）：行页 / 包页 / 设置左导航三入口，无重复');
+}
+{
+  // (2) 无管家 + 有 better-sidebar = withSidebar，逐项已断言；这里只核入口数。
+  assert.equal(withSidebar.rowPages.length, 1);
+  assert.equal(withSidebar.bundlePages.length, 1);
+  assert.equal(ourSections(withSidebar).length, 1, '入口不重复');
+  assert.equal(withSidebar.tabs.length, 1, 'tab 注册了但 hidden，不算设置入口');
+  ok('组合二（无管家、有 better-sidebar）：行页 / 包页 / 设置左导航，hidden tab 不添乱');
+}
+{
+  // (3) 有管家 + 有 better-sidebar：设置左导航让给管家，剩行页 + 包页两个入口。
+  const hubby = makeClientCtx({ withBetterSidebar: true });
+  hubby.ctx.slots.addEntry('settings.section', { id: 'dsh-Aina-settings-hub', order: 54 });
+  clientModule.apply(hubby.ctx);
+  assert.equal(ourSections(hubby).length, 0, '有管家 → 设置左导航没有第二格');
+  assert.equal(hubby.rowPages.length, 1, '行配置页仍在（插件页里唯一能点到的入口）');
+  assert.equal(hubby.bundlePages.length, 1, '包配置页仍在');
+  assert.equal(hubby.tabs.length, 1);
+  ok('组合三（有管家、有 better-sidebar）：设置左导航交给管家，插件页行页 / 包页仍可进');
 }
 
 // ---------------------------------------------------------------- 渲染工具

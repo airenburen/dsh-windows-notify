@@ -50,8 +50,8 @@ dsh plugin --profile <profile> add https://github.com/airenburen/dsh-windows-not
 #   侧栏「插件」→ 安装 → 填同一个 git 地址
 ```
 
-装完**重启宿主**（客户端半边是已构建的 bundle，宿主会缓存模块），然后：
-设置 → 左侧导航「通知」（或按下面的其它入口）。
+装完**重启宿主**（客户端半边是已构建的 bundle，宿主会缓存模块），然后从
+[配置入口](#配置入口三种部署组合都能进且不重复) 里任一处进设置面板。
 
 ### 从本地目录（开发用）
 
@@ -81,29 +81,41 @@ node tools/install-desktop.mjs
 
 ## 配置
 
-**主入口：设置 → 左侧导航「管家」→ 顶部「通知」标签**。
+### 配置入口（三种部署组合都能进，且不重复）
 
-> 这一格由 [dsh-Aina-settings-hub](https://github.com/airenburen/dsh-Aina-settings-hub)（「管家」）
-> 统一提供：它在 `settings.section` 里注册一格，页内顶部是
-> 通知 / 截图管家 / 附件回收 三个标签，点「通知」才渲染本插件的面板。
->
-> 面板不是复制过去的：枢纽 `require('dsh-windows-notify')` 后取本模块导出的
-> `__panel.ConfigPanel` 直接渲染成 `<ConfigPanel compact={false} />`。所以以后改这一份
-> `lib/client.js`，枢纽里的「通知」标签跟着变，不存在两份要同步的 UI 代码。
->
-> **本插件自己刻意不再注册 `settings.section`**：枢纽那格与自注册那格会并存，
-> 设置里就会看到两个入口。缺了枢纽的部署，面板从下面两处入口照样进得去。
+| 部署组合 | 设置 → 左侧导航 | 插件页 → 本插件那一行 | 插件页 → 包详情 |
+| --- | --- | --- | --- |
+| 无管家、无 better-sidebar | **「通知」一格**（本插件自己注册） | ✓ | ✓ |
+| 无管家、有 better-sidebar | **「通知」一格**（本插件自己注册） | ✓ | ✓ |
+| 有管家 + 任意 | 管家那一格 →「通知」标签 | ✓ | ✓ |
 
-**另一处入口：设置 → 侧边栏卡片 → 找到「通知」卡片 → 卡片上的齿轮**（DSH-better-sidebar 的设置页）。
+三个入口渲染的都是**同一份** `lib/client.js` 里的 `ConfigPanel`，不存在两份要同步的 UI 代码。
 
-> better-sidebar 给每个注册的 tab 类型在它的设置页放一张卡片，卡片的齿轮渲染
-> `settings.render`；所以插件用
-> `ctx.betterSidebar.registerTab({ ..., hidden: true, settings: { render } })` 把**同一份面板**
-> 也挂在那里。`hidden: true` 是编辑器 / diff 内置类型的同一套路：**有设置卡片，但不往 DSH 原生
-> 「+」菜单里添一个用不上的侧栏页**。
+**入口一：设置 → 左侧导航**。本插件在 `settings.section` 注册一格 `id: 'dsh-windows-notify'`、
+`order: 55`、标题「通知」。
+
+> **只在没装 [dsh-Aina-settings-hub](https://github.com/airenburen/dsh-Aina-settings-hub)（「管家」）时注册。**
+> 管家也占 `settings.section`（`id: 'dsh-Aina-settings-hub'`、`order: 54`），它的页内顶部是
+> 通知 / 截图管家 / 附件回收 三个标签，点「通知」渲染的正是本模块导出的 `__panel.ConfigPanel`
+> （`require('dsh-windows-notify')` 后直接 `<ConfigPanel compact={false} />`）。两边都注册会让你
+> 在设置里看到两个进同一块面板的入口，所以这里让位。
 >
-> 没装 better-sidebar 的部署会**自动退回**插件行配置页（侧栏「插件」→ 已安装 →
-> `dsh-windows-notify` → 行上的「配置」）。三处入口共用同一个面板与同一份配置。
+> 插件加载顺序不保证，所以本插件**订阅**了 `settings.section` 的变更而不是只看一次：管家后到就
+> 撤掉自己那一格，管家被卸载就重新占回来。
+
+**入口二：插件页 → 点本插件那一行 → 行配置页**（`plugins.row.config`，key =
+`dsh-windows-notify#windows-notify`，即 `<包名>#<cordis.patch.yml 里的 entry id>`）。**任何部署组合**
+都保留这一处，不因为装了 better-sidebar 就撤掉——它反过来是「插件页里唯一总能点到的入口」。
+
+**入口三：插件页 → 点包名进包详情 → 包配置区**（`plugins.bundle.config`，key = 包名
+`dsh-windows-notify`）。官方按 `ledger.bundles.has(pkg.name)` 判定，所以这里不需要行 id，
+别人从插件市场装走、行 id 变了也照样能进。
+
+> **DSH-better-sidebar 那张卡片不提供配置入口。** 本插件确实 `registerTab({ hidden: true, settings: { render } })`
+> 注册了一个 tab 类型，但 better-sidebar 的 `tabInventory()` 硬过滤 `hidden !== true`——hidden 类型
+> **不出设置卡片**（编辑器 / diff 内置类型同理，它们也没有卡片）。留这个 tab 类型只为两件事：
+> 宿主能 `openTab('dsh-windows-notify')` 编程打开通知面板，以及 tab 本体（通道状态 / 最近通知 /
+> 测试按钮）可用。它也不进「+」菜单、不进开始页 guide。
 
 面板按用途分四组，一组一张卡片（分组定义在 `lib/client.js` 的 `SECTIONS`，与
 `__panel.SECTIONS` 同一份）：
@@ -358,7 +370,8 @@ node tools/test-activate.ps1   # 最小化 DSH → 触发 dsh://open → 确认�
 | 点「允许 / 拒绝」没反应 | 跑 `node tools/test-decision.mjs` 验证链路；它跑完会把协议恢复成原来的命令，之后插件会在下次启动时重新注册 |
 | 点了通知按钮、审批**已结算**，但界面上那张「等待审批」卡还在 | 卡片清理走客户端半边：确认 DSH 界面已刷新（客户端 bundle 换代后要重新加载页面）；`/decisions` 里应能看到那条事实。两分钟内没消失说明该 DSH 版本的 `uiSession` 面变了，B 兜底的文案也可能变了——把现象发我，我更新匹配规则 |
 | 不确定是不是「自己点到的」/ 审批怎么就被批准了 | 看 `%LOCALAPPDATA%\dsh-windows-notify\decision.log`：一行一次激活，含时间、允许/拒绝、以及拉起它的父进程（真人点击 = 通知平台 `WpnUserService`；脚本触发 = `powershell.exe`）。当前默认高危审批不发按钮，也能从源头少踩这个坑 |
-| 设置页里找不到「通知」卡片 | 卡片在**设置 → 侧边栏卡片 → 侧边栏内容**一组的**最后**（`hidden` 类型排在末尾）；没有的话先确认 `dsh-better-sidebar` 在运行，客户端半边改动需要**重启宿主**才生效 |
+| 设置里找不到「通知」一格 | 装了 `dsh-Aina-settings-hub` 时它会在「管家」那一格里（本插件让位）；没装则应出现在设置左侧导航。改的是 `lib/client.js`（已构建 bundle），**必须重启宿主**才生效 |
+| 插件页点本插件那一行没有配置页 | 行配置页 key 依赖 `cordis.patch.yml` 里的 `id: windows-notify`；若被改过就改用**包详情页**（点包名进去）的配置区，那个按包名走、不受行 id 影响 |
 | 想看插件日志 | 配置 `debugLog=true`，再在会话日志里找 `windows-notify:` 前缀 |
 | 从通知点「允许/拒绝」后界面上的审批卡不消失 | 侧栏「通知」页（或 `/status` 的 `cardCleanup` 字段）：`degraded` = 客户端的文案匹配失效了（DSH 换皮/换文案），A/B 两条清理路线都没走到；`settled` = 清理动作已发出（卡还挂着就是渲染层的问题，刷新页面） |
 | 通知发送明显变慢 | 看日志里有没有 `powerShell worker`：长驻通道没起来时会回退逐条 spawn（每条冷启动几百 ms）；连续 3 次起不来本轮进程不再重试。通道失败（注册表/协议）有 60 秒退避，`/status` 的 `decision.retryInMs` 能看到下次重试还有多久 |
@@ -382,7 +395,7 @@ lib/events.js        4 类「会话状态 → 通知」的事件监听（审批�
 lib/http-routes.js   全部 HTTP 路由 + 统一安全门（回环 + Origin）
 lib/channels.js      两条惰性注册通道（点击回 DSH / 按钮回传）+ 失败退避 + 按钮 token 记账
 lib/http.js          路由共用小工具（请求体解析 / JSON 回写 / 回环判定）
-lib/client.js        客户端半边（手写的已构建 bundle）：设置面板、better-sidebar 卡片、
+lib/client.js        客户端半边（手写的已构建 bundle）：设置面板、三个入口挂载、hidden tab、
                      前后台上报（pagehide/hidden 强制后台）、审批卡清理（结果上报宿主）
 lib/win-toast.js     WinRT Toast 发送器（Windows PowerShell 5.1 + -EncodedCommand）+ 撤下通知
 lib/protocol.js      点击目标 / 按钮回传的协议推导与注册（dsh://open 优先，dsh-notify: 兜底；
