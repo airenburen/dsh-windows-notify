@@ -254,7 +254,7 @@ const CONFIG_VALUE = {
   debugLog: false,
 };
 const READY_STATE = { status: 'ready', value: CONFIG_VALUE, revision: 7, error: undefined, busy: false, note: undefined };
-const ALL_KEYS = ['agentTool', 'aumid', 'debugLog', 'decisionButtons', 'decisionButtonsFor', 'decisionSeconds', 'dedupeMs', 'displaySeconds', 'enabled', 'focusOnClick', 'httpApi', 'language', 'maxPerMinute', 'notifyApproval', 'notifyError', 'notifyQuestion', 'notifyTurnEnd', 'sound', 'sticky', 'whenFocused'];
+const ALL_KEYS = ['agentTool', 'aumid', 'debugLog', 'decisionButtons', 'decisionButtonsFor', 'decisionSeconds', 'dedupeMs', 'displaySeconds', 'enabled', 'focusOnClick', 'httpApi', 'language', 'maxPerMinute', 'notifyApproval', 'notifyError', 'notifyQuestion', 'notifySubagents', 'notifyTurnEnd', 'sound', 'sticky', 'whenFocused'];
 
 /** better-sidebar 齿轮里的那个面板。 */
 const renderSidebarPanel = (state) => renderElement(tab.settings.render({ pluginSettings: {}, updatePluginSetting: () => {}, close: () => {} }), state);

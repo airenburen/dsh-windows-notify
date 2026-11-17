@@ -14,6 +14,16 @@
 
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+
+// 进程级隔离：决策账本（decisions.json）落在 %LOCALAPPDATA%，不隔离的话
+// 真实使用积累的历史会让「空账本/seq 从 1 开始」类断言读到用户数据。
+// 个别块内会再覆盖/恢复 LOCALAPPDATA，恢复后落回这个测试专用目录。
+process.env.LOCALAPPDATA ??= join(tmpdir(), 'dsh-wn-smoke-' + String(Date.now()));
+if (!process.env.LOCALAPPDATA.includes('dsh-wn-smoke')) {
+  // 已有真实 LOCALAPPDATA（例如开发者本机直跑）也要隔离开，别读写用户真实账本。
+  process.env.LOCALAPPDATA = join(tmpdir(), 'dsh-wn-smoke-' + String(Date.now()));
+}
 
 const { apply, Config, name, isForegroundReport } = await import('../lib/index.js');
 const { isPrivilegedApproval } = await import('../lib/messages.js');
@@ -256,7 +266,72 @@ ok('模块导出 name / Config / apply');
   assert.match(rendered[0].text, /已发送 Windows 通知/);
   ok('notify_user.execute / render');
 
-  // ---------------------------------------------------------------- 服务与 HTTP
+  // ------------------------------------------------- 子agent过滤（notifySubagents）
+{
+  const make = async (configValues) => {
+    const sent = [];
+    const made = makeCtx();
+    apply(made.ctx, volatileConfig(configValues), {
+      showWindowsToast: async (options) => { sent.push(options); return { ok: true }; },
+      resolveClickTarget: async () => APP_TARGET,
+      detectLauncher: () => ({ kind: 'none', label: '' }),
+      toastAvailability: () => ({ available: true, reason: 'ok' }),
+      ensureDecisionProtocol: async () => ({ ok: true, changed: false, script: 'test' }),
+    });
+    return { sent, ...made };
+  };
+
+  const subagent = { session: { header: { origin: 'subagent', cwd: 'D:\\杂类' } } };
+  const forked = { session: { header: { parentSessionId: 'parent-1', cwd: 'D:\\杂类' } } };
+  const root = { session: { header: { origin: 'root', cwd: 'D:\\杂类' } } };
+
+  // error：默认 notifySubagents=false，两种子agent形态都不弹，根会话照常弹
+  {
+    const { sent, handlers } = await make({ notifyError: true, dedupeMs: 0, maxPerMinute: 100 });
+    handlers.get('agent/error')[0]({ error: new Error('sub-1'), agent: subagent });
+    handlers.get('agent/error')[0]({ error: new Error('sub-2'), agent: forked });
+    await settle();
+    assert.equal(sent.length, 0, '两种子agent形态出错都不弹');
+    handlers.get('agent/error')[0]({ error: new Error('root-err'), agent: root });
+    await settle();
+    assert.equal(sent.length, 1, '根会话出错照常弹');
+    ok('子agent过滤：error 默认不弹（origin 与 parentSessionId 两种形态都识别）');
+  }
+
+  // error：notifySubagents=true 时子agent也弹
+  {
+    const { sent, handlers } = await make({ notifyError: true, notifySubagents: true, dedupeMs: 0, maxPerMinute: 100 });
+    handlers.get('agent/error')[0]({ error: new Error('sub-3'), agent: subagent });
+    await settle();
+    assert.equal(sent.length, 1, 'notifySubagents=true 时子agent出错也弹');
+    ok('子agent过滤：notifySubagents=true 恢复子agent出错通知');
+  }
+
+  // turn-end：notifyTurnEnd=true 时子agent默认不弹，根会话照常弹
+  {
+    const { sent, handlers } = await make({ notifyTurnEnd: true, dedupeMs: 0, maxPerMinute: 100 });
+    handlers.get('agent/turn-stopping')[0]({ agent: subagent });
+    handlers.get('agent/turn-stopping')[0]({ agent: forked });
+    await settle();
+    assert.equal(sent.length, 0, '子agent回合结束不弹');
+    handlers.get('agent/turn-stopping')[0]({ agent: root });
+    await settle();
+    assert.equal(sent.length, 1, '根会话回合结束照常弹');
+    ok('子agent过滤：turn-end 默认不弹');
+  }
+
+  // 审批不受子agent过滤影响（权限确认必须始终弹出）
+  {
+    const { sent, handlers } = await make({ notifyApproval: true, dedupeMs: 0, maxPerMinute: 100 });
+    const outcome = await handlers.get('approval/request')[0]({ toolName: 'pwsh', agent: subagent }, async () => 'allowed-once');
+    assert.equal(outcome, 'allowed-once', '子agent审批照常走瀑布');
+    await settle();
+    assert.equal(sent.length, 1, '子agent审批通知照发');
+    ok('子agent过滤：审批不受影响（权限确认始终弹出）');
+  }
+}
+
+// ---------------------------------------------------------------- 服务与 HTTP
   assert.ok(services.has('windowsNotify'), '发布 ctx.windowsNotify 服务');
   const viaService = await services.get('windowsNotify').send({ title: '服务调用', message: 'hello' });
   assert.equal(viaService.delivered, true);
@@ -489,7 +564,7 @@ ok('模块导出 name / Config / apply');
   const removed = [];
   const protoCalls = [];
   // 真实宿主进程里**没有** DSH_WEB_URL（那是注入给 shell 子进程的），这里也去掉，
-  // 才能验证「地址只能从请求上学到」这条路径。
+  // 才能验证「地址只能从请求学到」这条路径。
   const savedWebUrl = process.env.DSH_WEB_URL;
   delete process.env.DSH_WEB_URL;
   apply(made.ctx, volatileConfig({ dedupeMs: 0, decisionSeconds: 120 }), {
@@ -643,6 +718,11 @@ ok('模块导出 name / Config / apply');
     removeWindowsToast: async () => ({ ok: true }),
   });
   await learnOrigin(made);
+  // 账本是进程级共享的（前面的块已经写入过事实），断言只能针对「本块没有新增」，
+  // 所以先取基线，再对比 GUI 回答后的账本。
+  const feedBefore = makeExchange('GET');
+  await made.routes.find((item) => item.path.endsWith('/decisions')).handler(feedBefore.req, feedBefore.res);
+  const baselineCount = JSON.parse(feedBefore.captured.body).items.length;
   const approval = made.handlers.get('approval/request')[0];
   const outcome = await approval({ toolName: 'pwsh' }, async () => 'allowed-once');
   assert.equal(outcome, 'allowed-once', 'GUI 先答时用 GUI 的结果');
@@ -656,7 +736,7 @@ ok('模块导出 name / Config / apply');
   // GUI 自己答的：卡片本来就会消失，不该往 /decisions 里塞事实（免得客户端去点新卡片）。
   const feed = makeExchange('GET');
   await made.routes.find((item) => item.path.endsWith('/decisions')).handler(feed.req, feed.res);
-  assert.deepEqual(JSON.parse(feed.captured.body).items, [], 'GUI 回答不产生「从通知结算」的事实');
+  assert.equal(JSON.parse(feed.captured.body).items.length, baselineCount, 'GUI 回答不产生「从通知结算」的事实');
   ok('GUI 先回答：按钮 token 立即作废，审批仍用 GUI 的结果');
 }
 {
